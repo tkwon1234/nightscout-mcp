@@ -250,19 +250,118 @@ async def get_recent_treatments(hours: float = 12) -> dict:
     return {"count": len(out), "treatments": out}
 
 
+# ---- AAPS / OpenAPS device status --------------------------------------------
+# Loop (iOS) reports under `loop` and `uploader.battery`. AAPS and OpenAPS report
+# under `openaps` (suggested / enacted / iob) and a top-level `uploaderBattery`.
+# Nightscout's own client turns `uploaderBattery` into `uploader` while loading,
+# but the REST API returns the record as stored, so both shapes are read here.
+# The rules below follow Nightscout's lib/client-core/devicestatus/openaps.js.
+
+DEVICESTATUS_SCAN = 24  # about two hours of 5-minute AAPS uploads
+
+
+def _openaps_iob(openaps: dict) -> dict:
+    """`openaps.iob` is a dict, or a list whose first item is the current one."""
+    iob = openaps.get("iob")
+    if isinstance(iob, list):
+        iob = iob[0] if iob and isinstance(iob[0], dict) else None
+    return iob if isinstance(iob, dict) else {}
+
+
+def _ts_ms(rec: dict) -> int | None:
+    """Milliseconds for a suggested/enacted/iob block (`mills`, else `timestamp`/`time`)."""
+    if not isinstance(rec, dict):
+        return None
+    if isinstance(rec.get("mills"), (int, float)):
+        return int(rec["mills"])
+    for key in ("timestamp", "time"):
+        v = rec.get(key)
+        if isinstance(v, (int, float)):
+            return int(v)
+        if isinstance(v, str) and v:
+            try:
+                return int(datetime.fromisoformat(v.replace("Z", "+00:00")).timestamp() * 1000)
+            except ValueError:
+                continue
+    return None
+
+
+def _iso(ms: int | None) -> str | None:
+    if ms is None:
+        return None
+    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _openaps_loop(rows: list) -> dict | None:
+    """Loop health from recent AAPS/OpenAPS device statuses, newest first.
+
+    An enacted block counts only when the pump confirmed it (`received`, or the
+    historic misspelling `recieved`). The last loop time is the later of the
+    last confirmed enactment and the last suggestion, as Nightscout shows it.
+    """
+    rows = [r for r in rows if isinstance(r, dict) and isinstance(r.get("openaps"), dict)]
+    if not rows:
+        return None
+    last_enacted = last_not_enacted = last_suggested = None
+    for r in rows:
+        o = r["openaps"]
+        e = o.get("enacted")
+        t = _ts_ms(e) if isinstance(e, dict) else None
+        if t is not None:
+            if e.get("received") or e.get("recieved"):
+                last_enacted = max(last_enacted or t, t)
+            else:
+                last_not_enacted = max(last_not_enacted or t, t)
+        t = _ts_ms(o.get("suggested"))
+        if t is not None:
+            last_suggested = max(last_suggested or t, t)
+    last_loop = max([t for t in (last_enacted, last_suggested) if t is not None], default=None)
+    latest = rows[0]["openaps"]
+    sug = latest.get("suggested") if isinstance(latest.get("suggested"), dict) else {}
+    enacted = latest.get("enacted") if isinstance(latest.get("enacted"), dict) else {}
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    return {
+        "system": "openaps",
+        "last_success": _iso(last_loop),
+        "minutes_since_last_loop": None if last_loop is None else max(0, (now_ms - last_loop) // 60000),
+        "last_enacted": _iso(last_enacted),
+        "last_not_enacted": _iso(last_not_enacted),
+        "last_suggested": _iso(last_suggested),
+        "enacted": bool(enacted.get("received") or enacted.get("recieved")),
+        "failure": sug.get("error") or enacted.get("error") or None,
+    }
+
+
+def _first_with(rows: list, key: str) -> dict:
+    for r in rows:
+        if isinstance(r, dict) and r.get(key):
+            return r
+    return {}
+
+
 @mcp.tool
 async def get_insulin_on_board() -> dict:
     """Current IOB/COB from the latest device status (Loop/AAPS)."""
-    d = await _ns_get("/api/v1/devicestatus.json", {"count": 1})
+    d = await _ns_get("/api/v1/devicestatus.json", {"count": DEVICESTATUS_SCAN})
     if not d:
         return {"error": "no device status"}
-    s = d[0]
-    loop = s.get("loop", {})
+    s = _first_with(d, "loop") or _first_with(d, "openaps") or d[0]
+    loop = s.get("loop") or {}
+    if loop:
+        iob = (loop.get("iob") or {}).get("iob") if isinstance(loop.get("iob"), dict) else loop.get("iob")
+        cob = (loop.get("cob") or {}).get("cob") if isinstance(loop.get("cob"), dict) else loop.get("cob")
+    else:
+        openaps = s.get("openaps") or {}
+        iob = _openaps_iob(openaps).get("iob")
+        sug = openaps.get("suggested") if isinstance(openaps.get("suggested"), dict) else {}
+        cob = sug.get("COB")
+        if cob is None and isinstance(openaps.get("enacted"), dict):
+            cob = openaps["enacted"].get("COB")
     return {
         "time": s.get("created_at"),
         "device": s.get("device"),
-        "iob": (loop.get("iob") or {}).get("iob") if isinstance(loop.get("iob"), dict) else loop.get("iob"),
-        "cob": (loop.get("cob") or {}).get("cob") if isinstance(loop.get("cob"), dict) else loop.get("cob"),
+        "iob": iob,
+        "cob": cob,
         "raw": loop or s.get("openaps") or {},
     }
 
@@ -301,6 +400,10 @@ async def get_site_ages() -> dict:
     out = {}
     for key, label in labels.items():
         v = props.get(key) or {}
+        # `sage` nests its answer: {"Sensor Start": {...}, "Sensor Change": {...},
+        # "min": <the key of the one that counts>} (Nightscout plugins/sensorage.js).
+        if isinstance(v.get("min"), str) and isinstance(v.get(v["min"]), dict):
+            v = v[v["min"]]
         # `found` false means the plugin is on but has never seen the event —
         # reporting age 0 there would read as "just changed", the opposite.
         if not v or v.get("found") is False:
@@ -323,17 +426,24 @@ async def get_device_status() -> dict:
     What is about to fail. `get_insulin_on_board` reads the same record but
     only for IOB/COB; this is the hardware side of it.
     """
-    d = await _ns_get("/api/v1/devicestatus.json", {"count": 1})
+    d = await _ns_get("/api/v1/devicestatus.json", {"count": DEVICESTATUS_SCAN})
     if not d:
         return {"error": "no device status"}
     s = d[0]
-    pump = s.get("pump") or {}
-    loop = s.get("loop") or {}
+    pump = (_first_with(d, "pump") or s).get("pump") or {}
+    loop_rec = _first_with(d, "loop")
+    loop = loop_rec.get("loop") or {}
     battery = pump.get("battery") or {}
+    up = _first_with(d, "uploader").get("uploader") or {}
+    up_batt = up.get("battery")
+    if up_batt is None:
+        up_batt = _first_with(d, "uploaderBattery").get("uploaderBattery")
+    openaps_loop = None if loop else _openaps_loop(d)
     return {
         "time": s.get("created_at"),
         "device": s.get("device"),
-        "uploader_battery_percent": (s.get("uploader") or {}).get("battery"),
+        "uploader_battery_percent": up_batt,
+        "uploader_charging": _first_with(d, "uploaderBattery").get("isCharging") if "isCharging" in _first_with(d, "uploaderBattery") else None,
         "pump": {
             "reservoir_units": pump.get("reservoir"),
             "battery_percent": battery.get("percent"),
@@ -341,10 +451,10 @@ async def get_device_status() -> dict:
             "status": (pump.get("status") or {}).get("status"),
             "last_seen": pump.get("clock"),
         },
-        "loop": {
+        # A recommendation the loop made is reported as loop STATE, never
+        # surfaced as a suggestion to act on — this server does not advise.
+        "loop": openaps_loop if openaps_loop is not None else {
             "last_success": loop.get("timestamp"),
-            # A recommendation the loop made is reported as loop STATE, never
-            # surfaced as a suggestion to act on — this server does not advise.
             "enacted": bool(loop.get("enacted")),
             "failure": (loop.get("failureReason") or None),
         },
