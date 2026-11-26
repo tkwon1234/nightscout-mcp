@@ -236,11 +236,13 @@ async def time_in_range(hours: float = 24) -> dict:
 #   Profile Switch  profile, percentage, timeshift, duration
 #   Temporary Target targetBottom, targetTop, duration, reason
 #   boluses         type (AAPS: "SMB" / "NORMAL"), isSMB
+#   BG Check        glucose, glucoseType ("Finger" / "Sensor"), units
 _TREATMENT_EXTRA = (
     "absolute", "rate", "percent", "duration",
     "profile", "percentage", "timeshift",
     "targetBottom", "targetTop", "reason",
     "type", "isSMB",
+    "glucose", "glucoseType", "units",
 )
 
 
@@ -256,9 +258,12 @@ def _treatment_row(x: dict) -> dict:
         v = x.get(key)
         if v is None or v == "":
             continue
-        # `type` is already the event type above; AAPS's own bolus `type` goes
-        # under a separate name so neither overwrites the other.
-        row["bolus_type" if key == "type" else key] = v
+        # `type` is already the event type above, so AAPS's own `type` goes
+        # under another name. AAPS fills it on temp basals too ("NORMAL",
+        # "PUMP_SUSPEND"), where calling it a bolus type would mislead.
+        if key == "type":
+            key = "bolus_type" if "Bolus" in str(x.get("eventType") or "") else "aaps_type"
+        row[key] = v
     return row
 
 
@@ -268,7 +273,8 @@ async def get_recent_treatments(hours: float = 12, event_type: str = "") -> dict
 
     Temp basals carry `absolute` (U/h) and `duration` (minutes; 0 = cancel),
     profile switches carry `profile` and `percentage`, temporary targets carry
-    `targetBottom`/`targetTop`. Pass `event_type` (e.g. "Temp Basal") to return
+    `targetBottom`/`targetTop`, BG checks carry `glucose` (meter value) and
+    `glucoseType`. Pass `event_type` (e.g. "Temp Basal") to return
     only that kind.
     """
     since = (datetime.now(timezone.utc) - timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%S.000Z")

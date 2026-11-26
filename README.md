@@ -57,7 +57,7 @@ Claude, Claude Code and FastMCP's own client; nothing in it is Claude-specific.
 | `time_in_range` | Low / in-range / high split, average, GMI, CV% (default 24h) |
 | `glucose_patterns` | Glucose by hour of day — *when* you actually run low or high |
 | `compare_periods` | The last N days against the N before, with deltas |
-| `get_recent_treatments` | Boluses, carbs, site changes, temp basals (U/h, minutes), profile switches and temp targets (default 12h; `event_type` filters one kind) |
+| `get_recent_treatments` | Boluses, carbs, site changes, temp basals (U/h, minutes), profile switches, temp targets and meter BG checks (default 12h; `event_type` filters one kind) |
 | `get_loop_history` | Each AAPS/OpenAPS loop run (default 6h, max 72h): glucose, IOB/COB, eventual BG, the temp basal chosen and confirmed, the loop's reason text, and whether it suspended basal on a predicted low (`minGuardBG X < Y`) |
 
 **Interactive**
