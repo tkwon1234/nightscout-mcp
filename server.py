@@ -195,7 +195,7 @@ async def get_current_glucose() -> dict:
         "units": UNITS,
         "mgdl": mgdl,
         "direction": r.get("direction"),
-        "time": r.get("dateString"),
+        "time": (r.get("dateString") or r.get("created_at")),
         "device": r.get("device"),
     }
 
@@ -209,7 +209,7 @@ async def get_recent_glucose(hours: float = 3) -> dict:
         {"count": 5000, "find[date][$gte]": since},
     )
     pts = [
-        {"t": x.get("dateString"), "glucose": _fmt(x["sgv"]), "direction": x.get("direction")}
+        {"t": (x.get("dateString") or x.get("created_at")), "glucose": _fmt(x["sgv"]), "direction": x.get("direction")}
         for x in e
         if x.get("sgv") is not None
     ]
