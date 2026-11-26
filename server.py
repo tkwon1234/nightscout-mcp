@@ -29,6 +29,7 @@ Env:
 import hmac
 import json
 import os
+import re
 import statistics
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
@@ -229,24 +230,53 @@ async def time_in_range(hours: float = 24) -> dict:
     return {"hours": hours, **_tir_stats(vals)}
 
 
+# Fields a treatment carries only for some event types. They are copied when
+# present and left out otherwise, so a bolus row stays as short as it was.
+#   Temp Basal      absolute (U/h), rate, percent, duration (min) — duration 0 is a cancel
+#   Profile Switch  profile, percentage, timeshift, duration
+#   Temporary Target targetBottom, targetTop, duration, reason
+#   boluses         type (AAPS: "SMB" / "NORMAL"), isSMB
+_TREATMENT_EXTRA = (
+    "absolute", "rate", "percent", "duration",
+    "profile", "percentage", "timeshift",
+    "targetBottom", "targetTop", "reason",
+    "type", "isSMB",
+)
+
+
+def _treatment_row(x: dict) -> dict:
+    row = {
+        "time": x.get("created_at"),
+        "type": x.get("eventType"),
+        "insulin": x.get("insulin"),
+        "carbs": x.get("carbs"),
+        "notes": x.get("notes"),
+    }
+    for key in _TREATMENT_EXTRA:
+        v = x.get(key)
+        if v is None or v == "":
+            continue
+        # `type` is already the event type above; AAPS's own bolus `type` goes
+        # under a separate name so neither overwrites the other.
+        row["bolus_type" if key == "type" else key] = v
+    return row
+
+
 @mcp.tool
-async def get_recent_treatments(hours: float = 12) -> dict:
-    """Insulin boluses, carbs and other treatments from the past `hours`."""
+async def get_recent_treatments(hours: float = 12, event_type: str = "") -> dict:
+    """Insulin boluses, carbs and other treatments from the past `hours`.
+
+    Temp basals carry `absolute` (U/h) and `duration` (minutes; 0 = cancel),
+    profile switches carry `profile` and `percentage`, temporary targets carry
+    `targetBottom`/`targetTop`. Pass `event_type` (e.g. "Temp Basal") to return
+    only that kind.
+    """
     since = (datetime.now(timezone.utc) - timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
-    t = await _ns_get(
-        "/api/v1/treatments.json",
-        {"count": 1000, "find[created_at][$gte]": since},
-    )
-    out = [
-        {
-            "time": x.get("created_at"),
-            "type": x.get("eventType"),
-            "insulin": x.get("insulin"),
-            "carbs": x.get("carbs"),
-            "notes": x.get("notes"),
-        }
-        for x in t
-    ]
+    params = {"count": 5000, "find[created_at][$gte]": since}
+    if event_type:
+        params["find[eventType]"] = event_type
+    t = await _ns_get("/api/v1/treatments.json", params)
+    out = [_treatment_row(x) for x in t if isinstance(x, dict)]
     return {"count": len(out), "treatments": out}
 
 
@@ -363,6 +393,98 @@ async def get_insulin_on_board() -> dict:
         "iob": iob,
         "cob": cob,
         "raw": loop or s.get("openaps") or {},
+    }
+
+
+# What the loop's own reason text says about why it did what it did. Matched
+# on the strings AAPS 4.0 writes (DetermineBasalSMB.kt); a format change there
+# only empties these fields, the reason text itself is still returned.
+_RE_GUARD = re.compile(r"minGuardBG (-?[\d.]+) < (-?[\d.]+)")
+_RE_CAP = re.compile(r"adj\. req\. rate: (-?[\d.]+) to maxSafeBasal: (-?[\d.]+)")
+_RE_MAXIOB = re.compile(r"max_iob (-?[\d.]+)")
+
+LOOP_HISTORY_MAX_HOURS = 72
+
+
+def _num(v):
+    return v if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+
+def _loop_row(rec: dict) -> dict | None:
+    o = rec.get("openaps")
+    if not isinstance(o, dict):
+        return None
+    sug = o.get("suggested") if isinstance(o.get("suggested"), dict) else {}
+    enacted = o.get("enacted") if isinstance(o.get("enacted"), dict) else {}
+    if not sug and not enacted:
+        return None
+    iob = _openaps_iob(o)
+    reason = sug.get("reason") or enacted.get("reason") or ""
+    row = {
+        "time": _iso(_ts_ms(sug) or _ts_ms(enacted)) or rec.get("created_at"),
+        "bg": _num(sug.get("bg")),
+        "iob": _num(iob.get("iob")),
+        "basal_iob": _num(iob.get("basaliob")),
+        "cob": _num(sug.get("COB")),
+        "eventual_bg": _num(sug.get("eventualBG")),
+        "target_bg": _num(sug.get("targetBG")),
+        "sensitivity_ratio": _num(sug.get("sensitivityRatio")),
+        # What the loop decided this cycle. Absent rate means "keep the temp
+        # that is running" (the reason then says "no temp required").
+        "temp_rate": _num(sug.get("rate")),
+        "temp_duration": _num(sug.get("duration")),
+        "enacted_rate": _num(enacted.get("rate")) if enacted else None,
+        "enacted_duration": _num(enacted.get("duration")) if enacted else None,
+        "enacted_received": bool(enacted.get("received") or enacted.get("recieved")) if enacted else None,
+    }
+    m = _RE_GUARD.search(reason)
+    row["low_suspend"] = bool(m)
+    if m:
+        row["min_guard_bg"] = float(m.group(1))
+        row["low_threshold"] = float(m.group(2))
+    m = _RE_CAP.search(reason)
+    if m:
+        row["capped_at_max_safe_basal"] = float(m.group(2))
+    m = _RE_MAXIOB.search(reason)
+    if m:
+        row["limited_by_max_iob"] = float(m.group(1))
+    row["reason"] = reason
+    return {k: v for k, v in row.items() if v is not None}
+
+
+@mcp.tool
+async def get_loop_history(hours: float = 6) -> dict:
+    """What the AAPS/OpenAPS loop decided each cycle over the past `hours` (max 72).
+
+    One row per loop run, oldest first: glucose, IOB/COB, eventual BG, the temp
+    basal it chose (`temp_rate` U/h, `temp_duration` min) and what the pump
+    confirmed, plus the loop's own reason text. `low_suspend` is true when the
+    loop stopped basal because its lowest guard prediction fell under the
+    low threshold ("minGuardBG X < Y"), even with glucose high.
+    """
+    hours = max(0.5, min(float(hours), LOOP_HISTORY_MAX_HOURS))
+    since = (datetime.now(timezone.utc) - timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    # AAPS uploads about every 5 minutes; leave room for pump-only records.
+    count = int(hours * 12 * 3) + 50
+    d = await _ns_get(
+        "/api/v1/devicestatus.json",
+        {"count": count, "find[created_at][$gte]": since},
+    )
+    rows, seen = [], set()
+    for rec in d if isinstance(d, list) else []:
+        if not isinstance(rec, dict):
+            continue
+        row = _loop_row(rec)
+        if not row or row["time"] in seen:
+            continue
+        seen.add(row["time"])
+        rows.append(row)
+    rows.sort(key=lambda r: r["time"] or "")
+    return {
+        "hours": hours,
+        "count": len(rows),
+        "low_suspend_count": sum(1 for r in rows if r.get("low_suspend")),
+        "loops": rows,
     }
 
 
